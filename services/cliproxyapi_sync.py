@@ -100,14 +100,20 @@ def _extract_error_message(body_json: dict[str, Any], header_error_json: dict[st
 def _request_json(method: str, path: str, *, api_url: str | None = None, api_key: str | None = None, json_body: dict | None = None) -> Any:
     import requests
 
-    response = requests.request(
-        method,
-        f"{_base_url(api_url)}{path}",
-        headers=_headers(api_key),
-        json=json_body,
-        timeout=30,
-        verify=False,
-    )
+    target = f"{_base_url(api_url)}{path}"
+    try:
+        response = requests.request(
+            method,
+            target,
+            headers=_headers(api_key),
+            json=json_body,
+            timeout=30,
+            verify=False,
+        )
+    except requests.exceptions.ConnectionError as exc:
+        raise RuntimeError(f"CLIProxyAPI 无法连接，请确认服务已启动或 API URL 是否正确：{_base_url(api_url)}") from exc
+    except requests.exceptions.Timeout as exc:
+        raise RuntimeError(f"CLIProxyAPI 请求超时：{_base_url(api_url)}") from exc
     response.raise_for_status()
     if not response.content:
         return {}
@@ -230,7 +236,16 @@ def sync_chatgpt_cliproxyapi_status(
     api_key: str | None = None,
 ) -> dict[str, Any]:
     synced_at = _utcnow_iso()
-    files = list_auth_files(api_url=api_url, api_key=api_key)
+    try:
+        files = list_auth_files(api_url=api_url, api_key=api_key)
+    except Exception as exc:
+        return {
+            "uploaded": False,
+            "last_synced_at": synced_at,
+            "message": str(exc),
+            "remote_state": "unreachable",
+            "base_url": _base_url(api_url),
+        }
     matched = _match_auth_file(account, files)
 
     if not matched:
@@ -238,6 +253,8 @@ def sync_chatgpt_cliproxyapi_status(
             "uploaded": False,
             "last_synced_at": synced_at,
             "message": "未在 CLIProxyAPI 找到匹配的 Codex auth-file",
+            "remote_state": "not_found",
+            "base_url": _base_url(api_url),
         }
 
     account_id = extract_chatgpt_account_id(account)
@@ -245,6 +262,7 @@ def sync_chatgpt_cliproxyapi_status(
         "uploaded": True,
         "last_synced_at": synced_at,
         "message": "",
+        "base_url": _base_url(api_url),
         "auth_index": str(matched.get("auth_index") or "").strip(),
         "name": str(matched.get("name") or "").strip(),
         "provider": str(matched.get("provider") or matched.get("type") or "").strip(),
@@ -257,7 +275,20 @@ def sync_chatgpt_cliproxyapi_status(
         "remote_plan_type": str(((matched.get("id_token") or {}).get("plan_type") if isinstance(matched.get("id_token"), dict) else "") or "").strip(),
         "chatgpt_subscription_active_until": str(((matched.get("id_token") or {}).get("chatgpt_subscription_active_until") if isinstance(matched.get("id_token"), dict) else "") or "").strip(),
     }
-    remote.update(_probe_remote_auth(remote["auth_index"], account_id, api_url=api_url, api_key=api_key))
+    try:
+        remote.update(_probe_remote_auth(remote["auth_index"], account_id, api_url=api_url, api_key=api_key))
+    except Exception as exc:
+        remote.update(
+            {
+                "last_probe_at": synced_at,
+                "last_probe_status_code": 0,
+                "last_probe_error_code": "",
+                "last_probe_message": str(exc),
+                "remote_state": "unreachable",
+                "message": str(exc),
+            }
+        )
+        return remote
     if remote["status"] == "error" and remote["status_message"]:
         remote["message"] = remote["status_message"]
     elif remote["last_probe_message"]:

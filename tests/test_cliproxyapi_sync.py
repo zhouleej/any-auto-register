@@ -13,6 +13,18 @@ class DummyAccount:
 
 
 class CliproxyapiSyncTests(unittest.TestCase):
+    def test_sync_returns_unreachable_when_service_down(self):
+        account = DummyAccount()
+
+        with mock.patch(
+            "services.cliproxyapi_sync.list_auth_files",
+            side_effect=RuntimeError("CLIProxyAPI 无法连接，请确认服务已启动或 API URL 是否正确：http://127.0.0.1:8317"),
+        ):
+            result = sync_chatgpt_cliproxyapi_status(account, api_url="http://127.0.0.1:8317", api_key="demo")
+
+        self.assertEqual(result["remote_state"], "unreachable")
+        self.assertIn("无法连接", result["message"])
+
     def test_sync_returns_not_found_when_remote_auth_missing(self):
         account = DummyAccount()
 

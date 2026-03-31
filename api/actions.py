@@ -61,7 +61,7 @@ def execute_action(
 
     try:
         result = instance.execute_action(action_id, account, body.params)
-        if result.get("ok") and isinstance(result.get("account_extra_patch"), dict):
+        if isinstance(result.get("account_extra_patch"), dict):
             extra = acc_model.get_extra()
             _merge_extra_patch(extra, result["account_extra_patch"])
             acc_model.set_extra(extra)

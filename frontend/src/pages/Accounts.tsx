@@ -173,6 +173,12 @@ function cliproxyStateMeta(sync: any) {
   if (!sync || Object.keys(sync).length === 0) {
     return { color: 'default', label: '未同步' }
   }
+  if (sync.remote_state === 'unreachable') {
+    return { color: 'error', label: '不可连接' }
+  }
+  if (sync.remote_state === 'not_found') {
+    return { color: 'default', label: '远端未发现' }
+  }
   if (!sync.uploaded) {
     return { color: 'default', label: '未发现' }
   }
@@ -219,6 +225,7 @@ function CliproxySyncSummary({ sync }: { sync: any }) {
         {sync?.status_message ? <Tag>{`message: ${sync.status_message}`}</Tag> : null}
       </div>
       {sync?.name ? <Text type="secondary">auth-file: {sync.name}</Text> : null}
+      {sync?.base_url ? <Text type="secondary">API URL: {sync.base_url}</Text> : null}
       {sync?.last_synced_at ? <Text type="secondary">同步时间: {formatSyncTime(sync.last_synced_at)}</Text> : null}
       {sync?.last_refresh ? <Text type="secondary">远端刷新时间: {formatSyncTime(sync.last_refresh)}</Text> : null}
       {sync?.next_retry_after ? <Text type="secondary">下次重试时间: {formatSyncTime(sync.next_retry_after)}</Text> : null}
@@ -350,7 +357,11 @@ function ActionMenu({ acc, onRefresh }: { acc: any; onRefresh: () => void }) {
         body: JSON.stringify({ params: {} }),
       })
       if (!r.ok) {
-        showResult(actionLabel, 'error', r.error || '操作失败')
+        const data = r.data || {}
+        const probe = typeof data === 'object' && data ? data.probe || null : null
+        const cliproxySync = typeof data === 'object' && data ? data.sync || null : null
+        showResult(actionLabel, 'error', r.error || data.message || '操作失败', '', probe, cliproxySync)
+        onRefresh()
         return
       }
       const data = r.data || {}

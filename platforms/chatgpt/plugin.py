@@ -211,16 +211,18 @@ class ChatGPTPlatform(BasePlatform):
             from services.cliproxyapi_sync import sync_chatgpt_cliproxyapi_status
 
             sync_result = sync_chatgpt_cliproxyapi_status(a)
+            ok = bool(sync_result.get("uploaded")) and sync_result.get("remote_state") not in {"unreachable", "not_found"}
             summary = (
                 f"远端状态={sync_result.get('status') or 'not_found'}, "
                 f"探测={sync_result.get('remote_state') or 'not_checked'}"
             )
             return {
-                "ok": True,
+                "ok": ok,
                 "data": {
                     "message": f"CLIProxyAPI 状态同步完成：{summary}",
                     "sync": sync_result,
                 },
+                "error": sync_result.get("message") if not ok else "",
                 "account_extra_patch": {
                     "sync_statuses": {
                         "cliproxyapi": sync_result,
