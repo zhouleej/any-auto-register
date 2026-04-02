@@ -1,7 +1,10 @@
 import unittest
 from unittest import mock
 
-from platforms.chatgpt.register import RegistrationEngine, SignupFormResult
+from platforms.chatgpt.refresh_token_registration_engine import (
+    RefreshTokenRegistrationEngine,
+    SignupFormResult,
+)
 
 
 class DummyEmailService:
@@ -14,13 +17,45 @@ class DummyEmailService:
         return "123456"
 
 
+class SequenceEmailService(DummyEmailService):
+    def __init__(self, codes):
+        self.codes = list(codes)
+        self.calls = []
+
+    def get_verification_code(self, **kwargs):
+        self.calls.append(kwargs)
+        if not self.codes:
+            return None
+        return self.codes.pop(0)
+
+
 class RegistrationEngineFlowTests(unittest.TestCase):
     def _make_engine(self):
-        return RegistrationEngine(
+        return RefreshTokenRegistrationEngine(
             email_service=DummyEmailService(),
             proxy_url="http://127.0.0.1:7890",
             callback_logger=lambda msg: None,
         )
+
+    def test_get_verification_code_excludes_previously_used_codes(self):
+        email_service = SequenceEmailService(["111111", "222222"])
+        engine = RefreshTokenRegistrationEngine(
+            email_service=email_service,
+            proxy_url="http://127.0.0.1:7890",
+            callback_logger=lambda msg: None,
+        )
+        engine.email = "user@example.com"
+        engine.email_info = {"email": "user@example.com", "service_id": "svc-1"}
+        engine._otp_sent_at = 100.0
+
+        first_code = engine._get_verification_code()
+        second_code = engine._get_verification_code()
+
+        self.assertEqual(first_code, "111111")
+        self.assertEqual(second_code, "222222")
+        self.assertEqual(email_service.calls[0]["exclude_codes"], set())
+        self.assertEqual(email_service.calls[1]["exclude_codes"], {"111111"})
+        self.assertEqual(engine._used_verification_codes, {"111111", "222222"})
 
     def test_run_restarts_login_after_new_registration(self):
         engine = self._make_engine()

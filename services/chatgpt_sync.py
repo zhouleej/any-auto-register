@@ -122,6 +122,7 @@ def build_chatgpt_sync_account(account: Any):
 
     obj = _SyncAccount()
     obj.email = getattr(account, "email", "")
+    obj.user_id = getattr(account, "user_id", "")
     obj.access_token = extra.get("access_token") or getattr(account, "token", "")
     obj.refresh_token = extra.get("refresh_token", "")
     obj.id_token = extra.get("id_token", "")

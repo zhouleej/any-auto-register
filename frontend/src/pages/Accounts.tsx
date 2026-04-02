@@ -30,8 +30,13 @@ import {
   DeleteOutlined,
   SyncOutlined,
 } from '@ant-design/icons'
-import { apiFetch, API_BASE } from '@/lib/utils'
-import { normalizeExecutorForPlatform } from '@/lib/registerOptions'
+import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
+import { TaskLogPanel } from '@/components/TaskLogPanel'
+import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
+import { parseBooleanConfigValue } from '@/lib/configValueParsers'
+import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
+import { apiFetch, API_BASE, getToken } from '@/lib/utils'
+import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 
 const { Text } = Typography
 const ACCOUNT_PAGE_SIZE = 20
@@ -320,84 +325,6 @@ function CliproxySyncSummary({ sync }: { sync: any }) {
   )
 }
 
-function LogPanel({ taskId, onDone }: { taskId: string; onDone: () => void }) {
-  const [lines, setLines] = useState<string[]>([])
-  const [done, setDone] = useState(false)
-  const bottomRef = useRef<HTMLDivElement>(null)
-  const handleCopyAll = async () => {
-    try {
-      await navigator.clipboard.writeText(lines.join('\n'))
-      message.success('日志已复制')
-    } catch {
-      message.error('复制失败')
-    }
-  }
-
-  useEffect(() => {
-    if (!taskId) return
-    const es = new EventSource(`${API_BASE}/tasks/${taskId}/logs/stream`)
-    es.onmessage = (e) => {
-      const d = JSON.parse(e.data)
-      if (d.line) setLines((prev) => [...prev, d.line])
-      if (d.done) {
-        setDone(true)
-        es.close()
-        onDone()
-      }
-    }
-    es.onerror = () => es.close()
-    return () => es.close()
-  }, [taskId])
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [lines])
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 8 }}>
-        <Button size="small" icon={<CopyOutlined />} onClick={handleCopyAll} disabled={lines.length === 0}>
-          复制日志
-        </Button>
-      </div>
-      <div
-        className="log-panel"
-        style={{
-          flex: 1,
-          overflow: 'auto',
-          background: '#ffffff',
-          border: '1px solid #e5e7eb',
-          borderRadius: 8,
-          padding: 12,
-          fontFamily: 'monospace',
-          fontSize: 12,
-          minHeight: 200,
-          maxHeight: 400,
-          userSelect: 'text',
-          WebkitUserSelect: 'text',
-          cursor: 'text',
-          whiteSpace: 'pre-wrap',
-        }}
-      >
-        {lines.length === 0 && <div style={{ color: '#9ca3af' }}>等待日志...</div>}
-        {lines.map((l, i) => (
-          <div
-            key={i}
-            style={{
-              lineHeight: 1.5,
-              color: l.includes('✓') || l.includes('成功') ? '#059669' : l.includes('✗') || l.includes('失败') || l.includes('错误') ? '#dc2626' : '#1f2937',
-            }}
-          >
-            {l}
-          </div>
-        ))}
-        <div ref={bottomRef} />
-      </div>
-      {done && <div style={{ fontSize: 12, color: '#10b981', marginTop: 8 }}>注册完成</div>}
-    </div>
-  )
-}
-
 function StatusSyncTaskModal({
   open,
   taskId,
@@ -459,18 +386,60 @@ function StatusSyncTaskModal({
   useEffect(() => {
     if (!open || !taskId) return
 
-    const es = new EventSource(`${API_BASE}/tasks/${taskId}/logs/stream`)
-    es.onmessage = (e) => {
-      const d = JSON.parse(e.data)
-      if (d.line) {
-        setLines((prev) => [...prev, d.line].slice(-120))
-      }
-      if (d.done) {
-        es.close()
+    const controller = new AbortController()
+    let cancelled = false
+
+    const connectStream = async () => {
+      try {
+        const token = getToken()
+        const headers: Record<string, string> = {}
+        if (token) headers.Authorization = `Bearer ${token}`
+
+        const response = await fetch(`${API_BASE}/tasks/${taskId}/logs/stream`, {
+          headers,
+          signal: controller.signal,
+        })
+        if (!response.ok || !response.body) return
+
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+
+        while (!cancelled) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const parts = buffer.split('\n\n')
+          buffer = parts.pop() || ''
+
+          for (const part of parts) {
+            const match = part.match(/^data:\s*(.+)$/m)
+            if (!match) continue
+            try {
+              const payload = JSON.parse(match[1]) as { line?: string; done?: boolean }
+              if (payload.line) {
+                setLines((prev) => [...prev, payload.line!].slice(-120))
+              }
+              if (payload.done) {
+                return
+              }
+            } catch {
+              // ignore malformed SSE payload
+            }
+          }
+        }
+      } catch {
+        // ignore stream disconnects in the lightweight status modal
       }
     }
-    es.onerror = () => es.close()
-    return () => es.close()
+
+    void connectStream()
+
+    return () => {
+      cancelled = true
+      controller.abort()
+    }
   }, [open, taskId])
 
   const total = Number(task?.total || 0)
@@ -578,7 +547,6 @@ function StatusSyncTaskModal({
     </Modal>
   )
 }
-
 function ActionMenu({ acc, onRefresh, actions }: { acc: any; onRefresh: () => void; actions: any[] }) {
   const [resultOpen, setResultOpen] = useState(false)
   const [resultTitle, setResultTitle] = useState('')
@@ -758,6 +726,8 @@ export default function Accounts() {
   const [registerForm] = Form.useForm()
   const [addForm] = Form.useForm()
   const [detailForm] = Form.useForm()
+  const { mode: chatgptRegistrationMode, setMode: setChatgptRegistrationMode } =
+    usePersistentChatGPTRegistrationMode()
   const [importText, setImportText] = useState('')
   const [importLoading, setImportLoading] = useState(false)
   const [taskId, setTaskId] = useState<string | null>(null)
@@ -909,6 +879,59 @@ export default function Accounts() {
     try {
       const cfg = await apiFetch('/config')
       const executorType = normalizeExecutorForPlatform(currentPlatform, cfg.default_executor)
+      const registerExtra = {
+        mail_provider: cfg.mail_provider || 'luckmail',
+        laoudo_auth: cfg.laoudo_auth,
+        laoudo_email: cfg.laoudo_email,
+        laoudo_account_id: cfg.laoudo_account_id,
+        gptmail_base_url: cfg.gptmail_base_url,
+        gptmail_api_key: cfg.gptmail_api_key,
+        gptmail_domain: cfg.gptmail_domain,
+        maliapi_base_url: cfg.maliapi_base_url,
+        maliapi_api_key: cfg.maliapi_api_key,
+        maliapi_domain: cfg.maliapi_domain,
+        maliapi_auto_domain_strategy: cfg.maliapi_auto_domain_strategy,
+        yescaptcha_key: cfg.yescaptcha_key,
+        moemail_api_url: cfg.moemail_api_url,
+        skymail_api_base: cfg.skymail_api_base,
+        skymail_token: cfg.skymail_token,
+        skymail_domain: cfg.skymail_domain,
+        duckmail_address: cfg.duckmail_address,
+        duckmail_password: cfg.duckmail_password,
+        duckmail_api_url: cfg.duckmail_api_url,
+        duckmail_provider_url: cfg.duckmail_provider_url,
+        duckmail_bearer: cfg.duckmail_bearer,
+        freemail_api_url: cfg.freemail_api_url,
+        freemail_admin_token: cfg.freemail_admin_token,
+        freemail_username: cfg.freemail_username,
+        freemail_password: cfg.freemail_password,
+        cfworker_api_url: cfg.cfworker_api_url,
+        cfworker_admin_token: cfg.cfworker_admin_token,
+        cfworker_custom_auth: cfg.cfworker_custom_auth,
+        cfworker_domain: cfg.cfworker_domain,
+        cfworker_subdomain: cfg.cfworker_subdomain,
+        cfworker_random_subdomain: parseBooleanConfigValue(cfg.cfworker_random_subdomain),
+        cfworker_fingerprint: cfg.cfworker_fingerprint,
+        smstome_cookie: cfg.smstome_cookie,
+        smstome_country_slugs: cfg.smstome_country_slugs,
+        smstome_phone_attempts: cfg.smstome_phone_attempts,
+        smstome_otp_timeout_seconds: cfg.smstome_otp_timeout_seconds,
+        smstome_poll_interval_seconds: cfg.smstome_poll_interval_seconds,
+        smstome_sync_max_pages_per_country: cfg.smstome_sync_max_pages_per_country,
+        luckmail_base_url: cfg.luckmail_base_url,
+        luckmail_api_key: cfg.luckmail_api_key,
+        luckmail_email_type: cfg.luckmail_email_type,
+        luckmail_domain: cfg.luckmail_domain,
+      }
+      const chatgptRegistrationRequestAdapter =
+        buildChatGPTRegistrationRequestAdapter(
+          currentPlatform,
+          chatgptRegistrationMode,
+        )
+      const adaptedRegisterExtra = chatgptRegistrationRequestAdapter
+        ? chatgptRegistrationRequestAdapter.extendExtra(registerExtra)
+        : registerExtra
+
       const res = await apiFetch('/tasks/register', {
         method: 'POST',
         body: JSON.stringify({
@@ -919,41 +942,7 @@ export default function Accounts() {
           executor_type: executorType,
           captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
           proxy: null,
-          extra: {
-            mail_provider: cfg.mail_provider || 'laoudo',
-            laoudo_auth: cfg.laoudo_auth,
-            laoudo_email: cfg.laoudo_email,
-            laoudo_account_id: cfg.laoudo_account_id,
-            maliapi_base_url: cfg.maliapi_base_url,
-            maliapi_api_key: cfg.maliapi_api_key,
-            maliapi_domain: cfg.maliapi_domain,
-            maliapi_auto_domain_strategy: cfg.maliapi_auto_domain_strategy,
-            yescaptcha_key: cfg.yescaptcha_key,
-            moemail_api_url: cfg.moemail_api_url,
-            skymail_api_base: cfg.skymail_api_base,
-            skymail_token: cfg.skymail_token,
-            skymail_domain: cfg.skymail_domain,
-            duckmail_address: cfg.duckmail_address,
-            duckmail_password: cfg.duckmail_password,
-            duckmail_api_url: cfg.duckmail_api_url,
-            duckmail_provider_url: cfg.duckmail_provider_url,
-            duckmail_bearer: cfg.duckmail_bearer,
-            freemail_api_url: cfg.freemail_api_url,
-            freemail_admin_token: cfg.freemail_admin_token,
-            freemail_username: cfg.freemail_username,
-            freemail_password: cfg.freemail_password,
-            cfworker_api_url: cfg.cfworker_api_url,
-            cfworker_admin_token: cfg.cfworker_admin_token,
-            cfworker_custom_auth: cfg.cfworker_custom_auth,
-            cfworker_domain: cfg.cfworker_domain,
-            cfworker_fingerprint: cfg.cfworker_fingerprint,
-            smstome_cookie: cfg.smstome_cookie,
-            smstome_country_slugs: cfg.smstome_country_slugs,
-            smstome_phone_attempts: cfg.smstome_phone_attempts,
-            smstome_otp_timeout_seconds: cfg.smstome_otp_timeout_seconds,
-            smstome_poll_interval_seconds: cfg.smstome_poll_interval_seconds,
-            smstome_sync_max_pages_per_country: cfg.smstome_sync_max_pages_per_country,
-          },
+          extra: adaptedRegisterExtra,
         }),
       })
       setTaskId(res.task_id)
@@ -1565,7 +1554,7 @@ export default function Accounts() {
         {!taskId ? (
           <Form form={registerForm} layout="vertical" onFinish={handleRegister}>
             <Form.Item name="count" label="注册数量" initialValue={1} rules={[{ required: true }]}>
-              <Input type="number" min={1} max={99} />
+              <Input type="number" min={1} />
             </Form.Item>
             <Form.Item name="concurrency" label="并发数" initialValue={1} rules={[{ required: true }]}>
               <Input type="number" min={1} max={5} />
@@ -1573,6 +1562,14 @@ export default function Accounts() {
             <Form.Item name="register_delay_seconds" label="每个注册延迟(秒)" initialValue={0}>
               <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0 = 不延迟" />
             </Form.Item>
+            {currentPlatform === 'chatgpt' && (
+              <Form.Item label="ChatGPT Token 方案">
+                <ChatGPTRegistrationModeSwitch
+                  mode={chatgptRegistrationMode}
+                  onChange={setChatgptRegistrationMode}
+                />
+              </Form.Item>
+            )}
             <Form.Item>
               <Button type="primary" htmlType="submit" block loading={registerLoading}>
                 开始注册
@@ -1580,7 +1577,7 @@ export default function Accounts() {
             </Form.Item>
           </Form>
         ) : (
-          <LogPanel taskId={taskId} onDone={() => { load(); }} />
+          <TaskLogPanel taskId={taskId} onDone={() => { load(); }} />
         )}
       </Modal>
 

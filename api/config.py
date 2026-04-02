@@ -30,6 +30,9 @@ CONFIG_KEYS = [
     "maliapi_api_key",
     "maliapi_domain",
     "maliapi_auto_domain_strategy",
+    "gptmail_base_url",
+    "gptmail_api_key",
+    "gptmail_domain",
     "cfworker_api_url",
     "cfworker_admin_token",
     "cfworker_custom_auth",
@@ -81,6 +84,12 @@ class ConfigUpdate(BaseModel):
 @router.get("")
 def get_config():
     all_cfg = config_store.get_all()
+    if not all_cfg.get("mail_provider"):
+        all_cfg["mail_provider"] = "luckmail"
+    if not all_cfg.get("gptmail_base_url"):
+        all_cfg["gptmail_base_url"] = "https://mail.chatgpt.org.uk"
+    if not all_cfg.get("luckmail_base_url"):
+        all_cfg["luckmail_base_url"] = "https://mails.luckyous.com/"
     # 只返回已知 key，未设置的返回空字符串
     return {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
 

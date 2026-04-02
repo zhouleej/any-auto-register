@@ -2,7 +2,7 @@ import unittest
 from unittest import mock
 
 from core.db import AccountModel
-from services.chatgpt_sync import backfill_chatgpt_account_to_cpa
+from services.chatgpt_sync import backfill_chatgpt_account_to_cpa, build_chatgpt_sync_account
 
 
 class ChatGPTBackfillTests(unittest.TestCase):
@@ -22,6 +22,14 @@ class ChatGPTBackfillTests(unittest.TestCase):
             }
         )
         return account
+
+    def test_build_sync_account_preserves_user_id(self):
+        account = self._make_account()
+        account.user_id = "acct-123"
+
+        sync_account = build_chatgpt_sync_account(account)
+
+        self.assertEqual(sync_account.user_id, "acct-123")
 
     def test_backfill_skips_when_remote_auth_exists(self):
         account = self._make_account()

@@ -4,8 +4,12 @@ import random
 import string
 
 from core.base_mailbox import BaseMailbox
-from core.base_platform import Account, AccountStatus, BasePlatform, RegisterConfig
+from core.base_platform import Account, BasePlatform, RegisterConfig
 from core.registry import register
+from platforms.chatgpt.chatgpt_registration_mode_adapter import (
+    ChatGPTRegistrationContext,
+    build_chatgpt_registration_mode_adapter,
+)
 
 
 @register
@@ -39,8 +43,14 @@ class ChatGPTPlatform(BasePlatform):
             password = "".join(random.choices(string.ascii_letters + string.digits + "!@#$", k=16))
 
         proxy = self.config.proxy if self.config else None
+        browser_mode = (self.config.executor_type if self.config else None) or "protocol"
+        extra_config = (self.config.extra or {}) if self.config and getattr(self.config, "extra", None) else {}
         log_fn = getattr(self, "_log_fn", print)
-        from platforms.chatgpt.register import RegistrationEngine
+        max_retries = 3
+        try:
+            max_retries = int(extra_config.get("register_max_retries", 3) or 3)
+        except Exception:
+            max_retries = 3
 
         if self.mailbox:
             _mailbox = self.mailbox
@@ -89,17 +99,12 @@ class ChatGPTPlatform(BasePlatform):
                 def status(self):
                     return None
 
-            engine = RegistrationEngine(
-                email_service=GenericEmailService(),
-                proxy_url=proxy,
-                callback_logger=log_fn,
-            )
-            engine.email = email
-            engine.password = password
+            email_service = GenericEmailService()
         else:
             from core.base_mailbox import TempMailLolMailbox
 
             _tmail = TempMailLolMailbox(proxy=proxy)
+            _tmail._task_control = getattr(self, "_task_control", None)
 
             class TempMailEmailService:
                 service_type = type("ST", (), {"value": "tempmail_lol"})()
@@ -133,34 +138,24 @@ class ChatGPTPlatform(BasePlatform):
                 def status(self):
                     return None
 
-            engine = RegistrationEngine(
-                email_service=TempMailEmailService(),
-                proxy_url=proxy,
-                callback_logger=log_fn,
-            )
-            if email:
-                engine.email = email
-                engine.password = password
+            email_service = TempMailEmailService()
 
-        result = engine.run()
+        adapter = build_chatgpt_registration_mode_adapter(extra_config)
+        context = ChatGPTRegistrationContext(
+            email_service=email_service,
+            proxy_url=proxy,
+            callback_logger=log_fn,
+            email=email,
+            password=password,
+            browser_mode=browser_mode,
+            max_retries=max_retries,
+            extra_config=extra_config,
+        )
+        result = adapter.run(context)
         if not result or not result.success:
             raise RuntimeError(result.error_message if result else "注册失败")
 
-        return Account(
-            platform="chatgpt",
-            email=result.email,
-            password=result.password or password,
-            user_id=result.account_id,
-            token=result.access_token,
-            status=AccountStatus.REGISTERED,
-            extra={
-                "access_token": result.access_token,
-                "refresh_token": result.refresh_token,
-                "id_token": result.id_token,
-                "session_token": result.session_token,
-                "workspace_id": result.workspace_id,
-            },
-        )
+        return adapter.build_account(result, password)
 
     def get_platform_actions(self) -> list:
         return [
