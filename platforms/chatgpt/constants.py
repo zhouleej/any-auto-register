@@ -154,6 +154,8 @@ PASSWORD_CHARSET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567
 DEFAULT_PASSWORD_LENGTH = 12
 
 # 用户信息生成（用于注册）
+MIN_REGISTRATION_AGE = 20
+MAX_REGISTRATION_AGE = 45
 
 # 常用英文名
 FIRST_NAMES = [
@@ -174,9 +176,9 @@ def generate_random_user_info() -> dict:
     # 随机选择名字
     name = random.choice(FIRST_NAMES)
 
-    # 生成随机生日（18-45岁）
+    # 生成随机生日（20-45岁）
     current_year = datetime.now().year
-    birth_year = random.randint(current_year - 45, current_year - 18)
+    birth_year = random.randint(current_year - MAX_REGISTRATION_AGE, current_year - MIN_REGISTRATION_AGE)
     birth_month = random.randint(1, 12)
     # 根据月份确定天数
     if birth_month in [1, 3, 5, 7, 8, 10, 12]:

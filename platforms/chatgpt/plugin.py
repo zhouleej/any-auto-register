@@ -56,6 +56,12 @@ class ChatGPTPlatform(BasePlatform):
             _mailbox = self.mailbox
             _fixed_email = email
 
+            def _resolve_email(candidate_email: str = "") -> str:
+                resolved_email = str(_fixed_email or candidate_email or "").strip()
+                if not resolved_email:
+                    raise RuntimeError("custom_provider 返回空邮箱地址")
+                return resolved_email
+
             class GenericEmailService:
                 service_type = type("ST", (), {"value": "custom_provider"})()
 
@@ -67,10 +73,11 @@ class ChatGPTPlatform(BasePlatform):
                     if self._email and self._acct and _fixed_email:
                         return {"email": self._email, "service_id": self._acct.account_id, "token": ""}
                     self._acct = _mailbox.get_email()
+                    generated_email = getattr(self._acct, "email", "")
                     if not self._email:
-                        self._email = self._acct.email
+                        self._email = _resolve_email(generated_email)
                     elif not _fixed_email:
-                        self._email = self._acct.email
+                        self._email = _resolve_email(generated_email)
                     return {"email": self._email, "service_id": self._acct.account_id, "token": ""}
 
                 def get_verification_code(
@@ -112,7 +119,10 @@ class ChatGPTPlatform(BasePlatform):
                 def create_email(self, config=None):
                     acct = _tmail.get_email()
                     self._acct = acct
-                    return {"email": acct.email, "service_id": acct.account_id, "token": acct.account_id}
+                    resolved_email = str(getattr(acct, "email", "") or "").strip()
+                    if not resolved_email:
+                        raise RuntimeError("tempmail_lol 返回空邮箱地址")
+                    return {"email": resolved_email, "service_id": acct.account_id, "token": acct.account_id}
 
                 def get_verification_code(
                     self,

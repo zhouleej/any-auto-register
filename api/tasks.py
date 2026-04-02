@@ -243,10 +243,14 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
     start_gate_lock = threading.Lock()
     next_start_time = time.time()
 
-    def _sleep_with_control(wait_seconds: float) -> None:
+    def _sleep_with_control(
+        wait_seconds: float,
+        *,
+        attempt_id: int | None = None,
+    ) -> None:
         remaining = max(float(wait_seconds or 0), 0.0)
         while remaining > 0:
-            control.checkpoint()
+            control.checkpoint(attempt_id=attempt_id)
             chunk = min(0.25, remaining)
             time.sleep(chunk)
             remaining -= chunk
@@ -272,17 +276,20 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             proxy_pool = None
             _proxy = None
             current_email = req.email or ""
+            attempt_id: int | None = None
             try:
                 from core.proxy_pool import proxy_pool
 
                 control.checkpoint()
+                attempt_id = control.start_attempt()
+                control.checkpoint(attempt_id=attempt_id)
                 _proxy = req.proxy
                 if not _proxy:
                     _proxy = proxy_pool.get_next()
                 _proxy = normalize_proxy_url(_proxy)
                 if req.register_delay_seconds > 0:
                     with start_gate_lock:
-                        control.checkpoint()
+                        control.checkpoint(attempt_id=attempt_id)
                         now = time.time()
                         wait_seconds = max(0.0, next_start_time - now)
                         if wait_seconds > 0:
@@ -290,9 +297,12 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 task_id,
                                 f"第 {i + 1} 个账号启动前延迟 {wait_seconds:g} 秒",
                             )
-                            _sleep_with_control(wait_seconds)
+                            _sleep_with_control(
+                                wait_seconds,
+                                attempt_id=attempt_id,
+                            )
                         next_start_time = time.time() + req.register_delay_seconds
-                control.checkpoint()
+                control.checkpoint(attempt_id=attempt_id)
                 from core.config_store import config_store
 
                 merged_extra = config_store.get_all().copy()
@@ -308,9 +318,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 )
                 _mailbox = _build_mailbox(_proxy)
                 _platform = PlatformCls(config=_config, mailbox=_mailbox)
+                _platform._task_attempt_token = attempt_id
                 _platform._log_fn = lambda msg: _log(task_id, msg)
                 _platform.bind_task_control(control)
                 if getattr(_platform, "mailbox", None) is not None:
+                    _platform.mailbox._task_attempt_token = attempt_id
                     _platform.mailbox._log_fn = _platform._log_fn
                 _task_store.set_progress(task_id, f"{i + 1}/{req.count}")
                 _log(task_id, f"开始注册第 {i + 1}/{req.count} 个账号")
@@ -382,8 +394,10 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     error=str(e),
                 )
                 return AttemptResult.failed(str(e))
+            finally:
+                control.finish_attempt(attempt_id)
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 
         max_workers = min(req.concurrency, req.count, 5)
         stopped = False
@@ -392,6 +406,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             for f in as_completed(futures):
                 try:
                     result = f.result()
+                except CancelledError:
+                    continue
                 except Exception as e:
                     _log(task_id, f"✗ 任务线程异常: {e}")
                     errors.append(str(e))
@@ -404,6 +420,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     stopped = True
                 else:
                     errors.append(result.message)
+                if stopped or control.is_stop_requested():
+                    stopped = True
+                    for pending in futures:
+                        if pending is not f:
+                            pending.cancel()
     except Exception as e:
         _log(task_id, f"致命错误: {e}")
         _task_store.finish(

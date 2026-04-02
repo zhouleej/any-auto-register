@@ -29,6 +29,27 @@ class SequenceEmailService(DummyEmailService):
         return self.codes.pop(0)
 
 
+class EmptyEmailService(DummyEmailService):
+    service_type = type("ST", (), {"value": "custom_provider"})()
+
+    def create_email(self):
+        return {"email": "   ", "service_id": "svc-empty"}
+
+
+class _DummyHTTPClient:
+    def __init__(self, sessions):
+        self._sessions = list(sessions)
+        self._index = 0
+
+    @property
+    def session(self):
+        return self._sessions[self._index]
+
+    def close(self):
+        if self._index < len(self._sessions) - 1:
+            self._index += 1
+
+
 class RegistrationEngineFlowTests(unittest.TestCase):
     def _make_engine(self):
         return RefreshTokenRegistrationEngine(
@@ -56,6 +77,59 @@ class RegistrationEngineFlowTests(unittest.TestCase):
         self.assertEqual(email_service.calls[0]["exclude_codes"], set())
         self.assertEqual(email_service.calls[1]["exclude_codes"], {"111111"})
         self.assertEqual(engine._used_verification_codes, {"111111", "222222"})
+
+    def test_create_email_rejects_blank_email_from_provider(self):
+        engine = RefreshTokenRegistrationEngine(
+            email_service=EmptyEmailService(),
+            proxy_url="http://127.0.0.1:7890",
+            callback_logger=lambda msg: None,
+        )
+
+        ok = engine._create_email()
+
+        self.assertFalse(ok)
+        self.assertIsNone(engine.email)
+        self.assertIn("返回空邮箱地址", "\n".join(engine.logs))
+
+    @mock.patch("platforms.chatgpt.refresh_token_registration_engine.seed_oai_device_cookie")
+    @mock.patch(
+        "platforms.chatgpt.refresh_token_registration_engine.generate_device_id",
+        return_value="device-fixed",
+    )
+    def test_get_device_id_reuses_generated_value_across_auth_flow_reset(
+        self, _generate_device_id, mock_seed_cookie
+    ):
+        engine = self._make_engine()
+        first_session = mock.Mock()
+        first_session.cookies = mock.Mock()
+        first_session.get.return_value = mock.Mock(status_code=200)
+        second_session = mock.Mock()
+        second_session.cookies = mock.Mock()
+        second_session.get.return_value = mock.Mock(status_code=200)
+        engine.http_client = _DummyHTTPClient([first_session, second_session])
+
+        engine.oauth_start = mock.Mock(auth_url="https://auth.openai.com/oauth/authorize")
+        self.assertTrue(engine._init_session())
+        first_did = engine._get_device_id()
+
+        engine._reset_auth_flow()
+        engine.oauth_start = mock.Mock(auth_url="https://auth.openai.com/oauth/authorize")
+        self.assertTrue(engine._init_session())
+        second_did = engine._get_device_id()
+
+        self.assertEqual(first_did, "device-fixed")
+        self.assertEqual(second_did, "device-fixed")
+        _generate_device_id.assert_called_once()
+        self.assertEqual(first_session.get.call_count, 1)
+        self.assertEqual(second_session.get.call_count, 1)
+        self.assertEqual(
+            [call.args for call in mock_seed_cookie.call_args_list],
+            [
+                (first_session, "device-fixed"),
+                (second_session, "device-fixed"),
+                (second_session, "device-fixed"),
+            ],
+        )
 
     def test_run_restarts_login_after_new_registration(self):
         engine = self._make_engine()

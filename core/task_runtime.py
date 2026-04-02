@@ -63,6 +63,9 @@ class RegisterTaskControl:
         self._lock = threading.Lock()
         self._stop_requested = False
         self._pending_skip_requests = 0
+        self._next_attempt_id = 1
+        self._active_attempt_ids: set[int] = set()
+        self._skip_active_attempt_ids: set[int] = set()
 
     def request_stop(self) -> None:
         with self._lock:
@@ -70,13 +73,40 @@ class RegisterTaskControl:
 
     def request_skip_current(self) -> None:
         with self._lock:
-            self._pending_skip_requests += 1
+            if self._active_attempt_ids:
+                self._skip_active_attempt_ids.update(self._active_attempt_ids)
+            else:
+                self._pending_skip_requests += 1
 
-    def checkpoint(self, *, consume_skip: bool = True) -> None:
+    def start_attempt(self) -> int:
+        with self._lock:
+            attempt_id = self._next_attempt_id
+            self._next_attempt_id += 1
+            self._active_attempt_ids.add(attempt_id)
+            return attempt_id
+
+    def finish_attempt(self, attempt_id: int | None) -> None:
+        if attempt_id is None:
+            return
+        with self._lock:
+            self._active_attempt_ids.discard(attempt_id)
+            self._skip_active_attempt_ids.discard(attempt_id)
+
+    def checkpoint(
+        self,
+        *,
+        consume_skip: bool = True,
+        attempt_id: int | None = None,
+    ) -> None:
         with self._lock:
             if self._stop_requested:
                 raise StopTaskRequested()
-            if consume_skip and self._pending_skip_requests > 0:
+            if not consume_skip:
+                return
+            if attempt_id is not None and attempt_id in self._skip_active_attempt_ids:
+                self._skip_active_attempt_ids.discard(attempt_id)
+                raise SkipCurrentAttemptRequested()
+            if self._pending_skip_requests > 0:
                 self._pending_skip_requests -= 1
                 raise SkipCurrentAttemptRequested()
 
@@ -89,6 +119,8 @@ class RegisterTaskControl:
             return {
                 "stop_requested": self._stop_requested,
                 "pending_skip_requests": self._pending_skip_requests,
+                "active_attempts": len(self._active_attempt_ids),
+                "targeted_skip_attempts": len(self._skip_active_attempt_ids),
             }
 
 

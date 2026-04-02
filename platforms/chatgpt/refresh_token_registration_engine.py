@@ -18,6 +18,7 @@ from curl_cffi import requests as cffi_requests
 from core.task_runtime import TaskInterruption
 from .oauth import OAuthManager, OAuthStart
 from .http_client import OpenAIHTTPClient, HTTPClientError
+from .utils import generate_device_id, seed_oai_device_cookie
 # from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType  # removed: external dep
 # from ..database import crud  # removed: external dep
 # from ..database.session import get_db  # removed: external dep
@@ -133,6 +134,7 @@ class RefreshTokenRegistrationEngine:
         self.session_token: Optional[str] = None  # 会话令牌
         self.logs: list = []
         self._otp_sent_at: Optional[float] = None  # OTP 发送时间戳
+        self._device_id: Optional[str] = None  # 当前注册流程复用的 Device ID
         self._used_verification_codes = set()  # 已取过的验证码，避免二次登录时捞到旧码
         self._is_existing_account: bool = False  # 是否为已注册账号（用于自动登录）
         self._token_acquisition_requires_login: bool = False  # 新注册账号需要二次登录拿 token
@@ -187,7 +189,16 @@ class RefreshTokenRegistrationEngine:
                 self._log("创建邮箱失败: 返回信息不完整", "error")
                 return False
 
-            self.email = self.email_info["email"]
+            email_value = str(self.email_info.get("email") or "").strip()
+            if not email_value:
+                self._log(
+                    f"创建邮箱失败: {self.email_service.service_type.value} 返回空邮箱地址",
+                    "error",
+                )
+                return False
+
+            self.email_info["email"] = email_value
+            self.email = email_value
             self._log(f"成功创建邮箱: {self.email}")
             return True
 
@@ -210,34 +221,45 @@ class RefreshTokenRegistrationEngine:
         """初始化会话"""
         try:
             self.session = self.http_client.session
+            if self._device_id:
+                seed_oai_device_cookie(self.session, self._device_id)
             return True
         except Exception as e:
             self._log(f"初始化会话失败: {e}", "error")
             return False
 
     def _get_device_id(self) -> Optional[str]:
-        """获取 Device ID"""
+        """获取并复用 Device ID，同时访问 OAuth URL 建立当前会话。"""
         if not self.oauth_start:
             return None
 
+        if not self._device_id:
+            self._device_id = generate_device_id()
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             try:
                 if not self.session:
                     self.session = self.http_client.session
 
+                seed_oai_device_cookie(self.session, self._device_id)
                 response = self.session.get(
                     self.oauth_start.auth_url,
                     timeout=20
                 )
-                did = self.session.cookies.get("oai-did")
 
-                if did:
+                cookie_did = self.session.cookies.get("oai-did")
+                did = (
+                    str(cookie_did).strip()
+                    if isinstance(cookie_did, str) and str(cookie_did).strip()
+                    else self._device_id
+                )
+                if response.status_code < 400 and did:
+                    self._device_id = did
                     self._log(f"Device ID: {did}")
                     return did
 
                 self._log(
-                    f"获取 Device ID 失败: 未返回 oai-did Cookie (HTTP {response.status_code}, 第 {attempt}/{max_attempts} 次)",
+                    f"获取 Device ID 失败: 建立 OAuth 会话返回 HTTP {response.status_code} (第 {attempt}/{max_attempts} 次)",
                     "warning" if attempt < max_attempts else "error"
                 )
             except Exception as e:
@@ -876,6 +898,7 @@ class RefreshTokenRegistrationEngine:
             self._is_existing_account = False
             self._token_acquisition_requires_login = False
             self._otp_sent_at = None
+            self._device_id = None
             self._used_verification_codes.clear()
 
             self._log("=" * 60)

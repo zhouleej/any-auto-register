@@ -27,7 +27,10 @@ class BaseMailbox(ABC):
         task_control = getattr(self, "_task_control", None)
         if task_control is None:
             return
-        task_control.checkpoint(consume_skip=consume_skip)
+        task_control.checkpoint(
+            consume_skip=consume_skip,
+            attempt_id=getattr(self, "_task_attempt_token", None),
+        )
 
     def _sleep_with_checkpoint(self, seconds: float) -> None:
         remaining = max(float(seconds or 0), 0.0)
@@ -818,9 +821,38 @@ class DuckMailMailbox(BaseMailbox):
         code_pattern: str = None,
         **kwargs,
     ) -> str:
+        from datetime import datetime
         import re
 
         seen = set(before_ids or [])
+        exclude_codes = {
+            str(code).strip()
+            for code in (kwargs.get("exclude_codes") or set())
+            if str(code or "").strip()
+        }
+        otp_sent_at = kwargs.get("otp_sent_at")
+
+        def _parse_message_timestamp(*values) -> Optional[float]:
+            for value in values:
+                if value in (None, ""):
+                    continue
+                if isinstance(value, (int, float)):
+                    numeric = float(value)
+                    return numeric / 1000 if numeric > 10_000_000_000 else numeric
+                text = str(value).strip()
+                if not text:
+                    continue
+                try:
+                    numeric = float(text)
+                    return numeric / 1000 if numeric > 10_000_000_000 else numeric
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    normalized = text.replace("Z", "+00:00")
+                    return datetime.fromisoformat(normalized).timestamp()
+                except ValueError:
+                    continue
+            return None
 
         def poll_once() -> Optional[str]:
             try:
@@ -843,11 +875,30 @@ class DuckMailMailbox(BaseMailbox):
                             + str(detail.get("subject") or "")
                         )
                     except Exception:
+                        detail = {}
                         body = str(msg.get("subject") or "")
+                    message_ts = _parse_message_timestamp(
+                        detail.get("createdAt"),
+                        detail.get("created_at"),
+                        detail.get("receivedAt"),
+                        detail.get("received_at"),
+                        detail.get("date"),
+                        detail.get("created"),
+                        msg.get("createdAt"),
+                        msg.get("created_at"),
+                        msg.get("receivedAt"),
+                        msg.get("received_at"),
+                        msg.get("date"),
+                        msg.get("created"),
+                    )
+                    if otp_sent_at and message_ts and message_ts < float(otp_sent_at):
+                        continue
                     body = re.sub(
                         r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", "", body
                     )
                     code = self._safe_extract(body, code_pattern)
+                    if code and code in exclude_codes:
+                        continue
                     if code:
                         return code
             except Exception:
@@ -2094,6 +2145,11 @@ class FreemailMailbox(BaseMailbox):
         **kwargs,
     ) -> str:
         seen = set(before_ids or [])
+        exclude_codes = {
+            str(code).strip()
+            for code in (kwargs.get("exclude_codes") or set())
+            if str(code or "").strip()
+        }
 
         def poll_once() -> Optional[str]:
             try:
@@ -2108,8 +2164,10 @@ class FreemailMailbox(BaseMailbox):
                         continue
                     seen.add(mid)
                     # 直接用 verification_code 字段
-                    code = str(msg.get("verification_code") or "")
+                    code = str(msg.get("verification_code") or "").strip()
                     if code and code != "None":
+                        if code in exclude_codes:
+                            continue
                         return code
                     # 兜底：从 preview 提取
                     text = (
@@ -2117,6 +2175,8 @@ class FreemailMailbox(BaseMailbox):
                     )
                     code = self._safe_extract(text, code_pattern)
                     if code:
+                        if code in exclude_codes:
+                            continue
                         return code
             except Exception:
                 pass

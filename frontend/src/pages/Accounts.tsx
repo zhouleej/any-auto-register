@@ -358,7 +358,7 @@ function StatusSyncTaskModal({
         const nextTask = await apiFetch(`/tasks/${taskId}`)
         if (cancelled) return
         setTask(nextTask)
-        if ((nextTask.status === 'done' || nextTask.status === 'failed') && !finishedRef.current) {
+        if ((nextTask.status === 'done' || nextTask.status === 'failed' || nextTask.status === 'stopped') && !finishedRef.current) {
           finishedRef.current = true
           onFinished(nextTask)
         }
@@ -446,7 +446,7 @@ function StatusSyncTaskModal({
   const completed = Number(task?.completed || 0)
   const success = Number(task?.success || 0)
   const failed = Number(task?.failed || 0)
-  const finished = task?.status === 'done' || task?.status === 'failed'
+  const finished = task?.status === 'done' || task?.status === 'failed' || task?.status === 'stopped'
   const percent = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : finished ? 100 : 0
   const progressStatus = task?.status === 'failed' ? 'exception' : finished ? 'success' : 'active'
   const recentLines = lines.slice(-8)
