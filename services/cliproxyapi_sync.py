@@ -7,7 +7,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Callable
 
 from platforms.chatgpt.status_probe import CODEX_USER_AGENT, extract_chatgpt_account_id
 from services.chatgpt_account_state import is_account_deactivated_message
@@ -356,6 +356,7 @@ def sync_chatgpt_cliproxyapi_status_batch(
     *,
     api_url: str | None = None,
     api_key: str | None = None,
+    on_progress: Optional[Callable[[int, int, Any, dict[str, Any]], None]] = None,
 ) -> dict[int, dict[str, Any]]:
     synced_at = _utcnow_iso()
     results: dict[int, dict[str, Any]] = {}
@@ -372,10 +373,16 @@ def sync_chatgpt_cliproxyapi_status_batch(
             "remote_state": "unreachable",
             "base_url": _base_url(api_url),
         }
-        for account in accounts:
+        for index, account in enumerate(accounts, start=1):
             account_id = getattr(account, "id", None)
             if account_id is not None:
-                results[int(account_id)] = dict(fallback)
+                result = dict(fallback)
+                results[int(account_id)] = result
+                if on_progress:
+                    try:
+                        on_progress(index, len(accounts), account, result)
+                    except Exception:
+                        logger.exception("CLIProxyAPI 批量同步进度回调失败: account=%s", account_id)
         logger.warning("CLIProxyAPI 批量同步失败：无法获取 auth-files, accounts=%s, error=%s", len(accounts), exc)
         return results
 
@@ -384,7 +391,13 @@ def sync_chatgpt_cliproxyapi_status_batch(
         if account_id is None:
             continue
         matched = _match_auth_file(account, files)
-        results[int(account_id)] = _build_remote_sync_result(account, matched, synced_at, api_url=api_url, api_key=api_key)
+        result = _build_remote_sync_result(account, matched, synced_at, api_url=api_url, api_key=api_key)
+        results[int(account_id)] = result
+        if on_progress:
+            try:
+                on_progress(index + 1, len(accounts), account, result)
+            except Exception:
+                logger.exception("CLIProxyAPI 批量同步进度回调失败: account=%s", account_id)
         if index < len(accounts) - 1 and matched:
             time.sleep(BATCH_PROBE_DELAY_SECONDS)
 

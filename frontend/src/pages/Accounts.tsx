@@ -15,6 +15,7 @@ import {
   Dropdown,
   Typography,
   Alert,
+  Progress,
   theme,
 } from 'antd'
 import type { MenuProps } from 'antd'
@@ -397,6 +398,187 @@ function LogPanel({ taskId, onDone }: { taskId: string; onDone: () => void }) {
   )
 }
 
+function StatusSyncTaskModal({
+  open,
+  taskId,
+  title,
+  onClose,
+  onFinished,
+}: {
+  open: boolean
+  taskId: string | null
+  title: string
+  onClose: () => void
+  onFinished: (task: any) => void
+}) {
+  const [task, setTask] = useState<any>(null)
+  const [lines, setLines] = useState<string[]>([])
+  const finishedRef = useRef(false)
+
+  useEffect(() => {
+    if (!open || !taskId) return
+    setTask(null)
+    setLines([])
+    finishedRef.current = false
+  }, [open, taskId])
+
+  useEffect(() => {
+    if (!open || !taskId) return
+
+    let cancelled = false
+    const pollTask = async () => {
+      try {
+        const nextTask = await apiFetch(`/tasks/${taskId}`)
+        if (cancelled) return
+        setTask(nextTask)
+        if ((nextTask.status === 'done' || nextTask.status === 'failed') && !finishedRef.current) {
+          finishedRef.current = true
+          onFinished(nextTask)
+        }
+      } catch (e: any) {
+        if (cancelled || finishedRef.current) return
+        const failedTask = {
+          status: 'failed',
+          error: e?.message || '任务状态获取失败',
+          result: { total: 0, success: 0, failed: 0, items: [] },
+        }
+        setTask(failedTask)
+        finishedRef.current = true
+        onFinished(failedTask)
+      }
+    }
+
+    pollTask()
+    const interval = window.setInterval(pollTask, 1000)
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [open, taskId, onFinished])
+
+  useEffect(() => {
+    if (!open || !taskId) return
+
+    const es = new EventSource(`${API_BASE}/tasks/${taskId}/logs/stream`)
+    es.onmessage = (e) => {
+      const d = JSON.parse(e.data)
+      if (d.line) {
+        setLines((prev) => [...prev, d.line].slice(-120))
+      }
+      if (d.done) {
+        es.close()
+      }
+    }
+    es.onerror = () => es.close()
+    return () => es.close()
+  }, [open, taskId])
+
+  const total = Number(task?.total || 0)
+  const completed = Number(task?.completed || 0)
+  const success = Number(task?.success || 0)
+  const failed = Number(task?.failed || 0)
+  const finished = task?.status === 'done' || task?.status === 'failed'
+  const percent = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : finished ? 100 : 0
+  const progressStatus = task?.status === 'failed' ? 'exception' : finished ? 'success' : 'active'
+  const recentLines = lines.slice(-8)
+  const failedItems = ((task?.result?.items || []) as any[]).filter((item) => !item.ok)
+  const failedPreview = failedItems.slice(0, 12)
+
+  return (
+    <Modal
+      title={title}
+      open={open}
+      onCancel={finished ? onClose : undefined}
+      footer={
+        finished
+          ? [
+              <Button key="close" type="primary" onClick={onClose}>
+                关闭
+              </Button>,
+            ]
+          : null
+      }
+      maskClosable={finished}
+      closable={finished}
+      width={760}
+    >
+      <Space direction="vertical" size={12} style={{ width: '100%' }}>
+        <Alert
+          type={task?.status === 'failed' ? 'error' : finished ? 'success' : 'info'}
+          showIcon
+          message={
+            task?.status === 'failed'
+              ? '同步失败'
+              : finished
+              ? '同步完成'
+              : '正在同步 CLIProxyAPI 状态'
+          }
+          description={
+            task?.status === 'failed'
+              ? task?.error || '任务执行失败'
+              : `当前进度 ${task?.progress || '0/0'}`
+          }
+        />
+
+        <Progress percent={percent} status={progressStatus} />
+
+        <Space wrap>
+          <Tag color="processing">进度 {task?.progress || '0/0'}</Tag>
+          <Tag color="success">成功 {success}</Tag>
+          <Tag color={failed > 0 ? 'error' : 'default'}>失败 {failed}</Tag>
+        </Space>
+
+        <div>
+          <Text strong>最近日志</Text>
+          <pre
+            style={{
+              margin: '8px 0 0',
+              maxHeight: 220,
+              overflow: 'auto',
+              padding: 12,
+              borderRadius: 8,
+              background: 'rgba(127,127,127,0.08)',
+              fontSize: 12,
+              lineHeight: 1.5,
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+            }}
+          >
+            {recentLines.length > 0 ? recentLines.join('\n') : '等待同步状态更新...'}
+          </pre>
+        </div>
+
+        {finished && failedPreview.length > 0 ? (
+          <div>
+            <Text strong>失败摘要</Text>
+            <pre
+              style={{
+                margin: '8px 0 0',
+                maxHeight: 220,
+                overflow: 'auto',
+                padding: 12,
+                borderRadius: 8,
+                background: 'rgba(127,127,127,0.08)',
+                fontSize: 12,
+                lineHeight: 1.5,
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+              }}
+            >
+              {failedPreview
+                .map((item) => `[${item.id || '-'}] ${item.email || '-'}: ${item.message || '失败'}`)
+                .join('\n')}
+            </pre>
+            {failedItems.length > failedPreview.length ? (
+              <Text type="secondary">还有 {failedItems.length - failedPreview.length} 条失败记录未展开</Text>
+            ) : null}
+          </div>
+        ) : null}
+      </Space>
+    </Modal>
+  )
+}
+
 function ActionMenu({ acc, onRefresh, actions }: { acc: any; onRefresh: () => void; actions: any[] }) {
   const [resultOpen, setResultOpen] = useState(false)
   const [resultTitle, setResultTitle] = useState('')
@@ -582,6 +764,13 @@ export default function Accounts() {
   const [registerLoading, setRegisterLoading] = useState(false)
   const [cpaSyncLoading, setCpaSyncLoading] = useState<'pending' | 'selected' | ''>('')
   const [statusSyncLoading, setStatusSyncLoading] = useState<'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | ''>('')
+  const [statusSyncTask, setStatusSyncTask] = useState<{
+    taskId: string
+    title: string
+    actionLabel: string
+    scopeLabel: string
+    toastKey: string
+  } | null>(null)
 
   useEffect(() => {
     if (platform) {
@@ -938,7 +1127,25 @@ export default function Accounts() {
 
     setStatusSyncLoading(loadingKey)
     message.loading({ content: `${scopeLabel}${actionLabel}进行中...`, key: toastKey, duration: 0 })
+    let keepLoading = false
     try {
+      if (kind === 'remote') {
+        const task = await apiFetch(`/actions/${currentPlatform}/${actionId}/batch-task`, {
+          method: 'POST',
+          body: JSON.stringify(body),
+        })
+
+        setStatusSyncTask({
+          taskId: task.task_id,
+          title: `${scopeLabel}${actionLabel}`,
+          actionLabel,
+          scopeLabel,
+          toastKey,
+        })
+        keepLoading = true
+        return
+      }
+
       const result = await apiFetch(`/actions/${currentPlatform}/${actionId}/batch`, {
         method: 'POST',
         body: JSON.stringify(body),
@@ -959,9 +1166,38 @@ export default function Accounts() {
     } catch (e: any) {
       message.error({ content: `${actionLabel}失败: ${e.message}`, key: toastKey })
     } finally {
-      setStatusSyncLoading('')
+      if (!keepLoading) {
+        setStatusSyncLoading('')
+      }
     }
   }
+
+  const handleStatusSyncTaskFinished = useCallback(async (task: any) => {
+    const actionLabel = statusSyncTask?.actionLabel || 'CLIProxyAPI 状态同步'
+    const scopeLabel = statusSyncTask?.scopeLabel || '当前筛选账号'
+    const toastKey = statusSyncTask?.toastKey || 'status-sync:remote-task'
+    const result = task?.result || {
+      total: Number(task?.total || 0),
+      success: Number(task?.success || 0),
+      failed: Number(task?.failed || 0),
+      items: [],
+    }
+
+    if (task?.status === 'failed') {
+      message.error({ content: `${actionLabel}失败: ${task?.error || '任务执行失败'}`, key: toastKey })
+    } else if (!result.total) {
+      message.info({ content: '没有可处理的账号', key: toastKey })
+    } else if (!result.failed) {
+      message.success({ content: `${scopeLabel}${actionLabel}完成：成功 ${result.success} / ${result.total}`, key: toastKey })
+    } else if (!result.success) {
+      message.error({ content: `${scopeLabel}${actionLabel}失败：成功 ${result.success} / ${result.total}`, key: toastKey })
+    } else {
+      message.warning({ content: `${scopeLabel}${actionLabel}部分完成：成功 ${result.success} / ${result.total}`, key: toastKey })
+    }
+
+    setStatusSyncLoading('')
+    await load()
+  }, [load, statusSyncTask])
 
   const getStatusSyncScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
 
@@ -1308,6 +1544,14 @@ export default function Accounts() {
             setDetailModalOpen(true)
           },
         })}
+      />
+
+      <StatusSyncTaskModal
+        open={Boolean(statusSyncTask)}
+        taskId={statusSyncTask?.taskId || null}
+        title={statusSyncTask?.title || 'CLIProxyAPI 状态同步'}
+        onClose={() => setStatusSyncTask(null)}
+        onFinished={handleStatusSyncTaskFinished}
       />
 
       <Modal

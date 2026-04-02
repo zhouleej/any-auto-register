@@ -2,7 +2,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
-from typing import Optional
+from typing import Optional, Any, Callable
 from copy import deepcopy
 from core.db import TaskLog, engine
 import time, json, asyncio, threading, logging
@@ -77,19 +77,75 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
     return prepared
 
 
+def _next_task_id() -> str:
+    return f"task_{int(time.time() * 1000)}"
+
+
 def _create_task_record(
-    task_id: str, req: RegisterTaskRequest, source: str, meta: dict | None = None
+    task_id: str,
+    *,
+    platform: str,
+    source: str,
+    progress: str = "0/0",
+    meta: dict | None = None,
 ):
     with _tasks_lock:
         _tasks[task_id] = {
             "id": task_id,
             "status": "pending",
-            "platform": req.platform,
+            "platform": platform,
             "source": source,
             "meta": meta or {},
-            "progress": f"0/{req.count}",
+            "progress": progress,
             "logs": [],
         }
+
+
+def enqueue_background_task(
+    *,
+    platform: str,
+    source: str,
+    runner: Callable[..., Any],
+    runner_args: tuple[Any, ...] = (),
+    runner_kwargs: dict[str, Any] | None = None,
+    background_tasks: BackgroundTasks | None = None,
+    meta: dict | None = None,
+    progress: str = "0/0",
+) -> str:
+    task_id = _next_task_id()
+    _create_task_record(
+        task_id,
+        platform=platform,
+        source=source,
+        progress=progress,
+        meta=meta,
+    )
+    args = (task_id, *runner_args)
+    kwargs = runner_kwargs or {}
+    if background_tasks is None:
+        thread = threading.Thread(target=runner, args=args, kwargs=kwargs, daemon=True)
+        thread.start()
+    else:
+        background_tasks.add_task(runner, *args, **kwargs)
+    return task_id
+
+
+def update_task(task_id: str, *, meta_patch: dict[str, Any] | None = None, **fields: Any):
+    should_cleanup = False
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if not task:
+            return
+        if meta_patch:
+            task.setdefault("meta", {}).update(meta_patch)
+        task.update(fields)
+        should_cleanup = fields.get("status") in ("done", "failed")
+    if should_cleanup:
+        _cleanup_old_tasks()
+
+
+def append_task_log(task_id: str, msg: str):
+    _log(task_id, msg)
 
 
 def enqueue_register_task(
@@ -100,16 +156,15 @@ def enqueue_register_task(
     meta: dict | None = None,
 ) -> str:
     prepared = _prepare_register_request(req)
-    task_id = f"task_{int(time.time() * 1000)}"
-    _create_task_record(task_id, prepared, source, meta)
-    if background_tasks is None:
-        thread = threading.Thread(
-            target=_run_register, args=(task_id, prepared), daemon=True
-        )
-        thread.start()
-    else:
-        background_tasks.add_task(_run_register, task_id, prepared)
-    return task_id
+    return enqueue_background_task(
+        platform=prepared.platform,
+        source=source,
+        runner=_run_register,
+        runner_args=(prepared,),
+        background_tasks=background_tasks,
+        meta=meta,
+        progress=f"0/{prepared.count}",
+    )
 
 
 def has_active_register_task(

@@ -1,15 +1,16 @@
 """平台操作 API - 通用接口，各平台通过 get_platform_actions/execute_action 实现"""
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlmodel import Session, select
 from pydantic import BaseModel
 import json
-from typing import Any
-from core.db import AccountModel, get_session
+from typing import Any, Callable
+from core.db import AccountModel, get_session, engine
 from core.registry import get
 from core.base_platform import RegisterConfig
 from core.config_store import config_store
 from services.chatgpt_account_state import apply_chatgpt_status_policy
 from services.chatgpt_sync import update_account_model_cliproxy_sync
+from api.tasks import enqueue_background_task, update_task, append_task_log
 
 router = APIRouter(prefix="/actions", tags=["actions"])
 
@@ -171,7 +172,43 @@ def _result_message(result: dict[str, Any]) -> str:
     return str(result.get("error") or "").strip()
 
 
-def _execute_batch_cliproxy_sync(accounts: list[AccountModel], session: Session) -> dict[str, Any]:
+def _cliproxy_sync_state_label(sync_result: dict[str, Any]) -> str:
+    remote_state = str(sync_result.get("remote_state") or "").strip().lower()
+    mapping = {
+        "usable": "远端可用",
+        "account_deactivated": "账号已失效",
+        "access_token_invalidated": "令牌失效",
+        "unauthorized": "未授权",
+        "payment_required": "需付费/权限",
+        "quota_exhausted": "额度耗尽",
+        "probe_failed": "远端探测失败",
+        "probe_skipped": "未执行远端探测",
+        "not_found": "远端未发现",
+        "unreachable": "CLIProxyAPI 不可连接",
+    }
+    return mapping.get(remote_state, remote_state or "状态未知")
+
+
+def _build_cliproxy_batch_item(acc_model: AccountModel, sync_result: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    remote_state = str(sync_result.get("remote_state") or "").strip().lower()
+    ok = bool(sync_result.get("uploaded")) and remote_state not in {"unreachable", "not_found"}
+    label = _cliproxy_sync_state_label(sync_result)
+    detail = str(sync_result.get("message") or sync_result.get("status_message") or "").strip()
+    summary = label if not detail or detail == label else f"{label}: {detail}"
+    return ok, {
+        "id": acc_model.id,
+        "email": acc_model.email,
+        "ok": ok,
+        "message": f"CLIProxyAPI 状态同步完成：{summary}",
+        "status": acc_model.status,
+    }
+
+
+def _execute_batch_cliproxy_sync(
+    accounts: list[AccountModel],
+    session: Session,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     from services.cliproxyapi_sync import sync_chatgpt_cliproxyapi_status_batch
 
     class SyncAccount:
@@ -190,39 +227,160 @@ def _execute_batch_cliproxy_sync(accounts: list[AccountModel], session: Session)
             self.cookies = extra.get("cookies", "")
 
     sync_accounts = [SyncAccount(model) for model in accounts]
-    sync_results = sync_chatgpt_cliproxyapi_status_batch(sync_accounts)
-
     items = []
     success_count = 0
     failed_count = 0
-    for acc_model in accounts:
-        sync_result = sync_results.get(int(acc_model.id or 0), {})
+    model_by_id = {int(model.id or 0): model for model in accounts if model.id is not None}
+
+    def _on_progress(completed: int, total: int, account: Any, sync_result: dict[str, Any]):
+        nonlocal success_count, failed_count
+        account_id = int(getattr(account, "id", 0) or 0)
+        acc_model = model_by_id.get(account_id)
+        if acc_model is None:
+            return
         update_account_model_cliproxy_sync(acc_model, sync_result, session=session, commit=False)
-        remote_state = str(sync_result.get("remote_state") or "").strip().lower()
-        ok = bool(sync_result.get("uploaded")) and remote_state not in {"unreachable", "not_found"}
+        ok, item = _build_cliproxy_batch_item(acc_model, sync_result)
         if ok:
             success_count += 1
         else:
             failed_count += 1
-        summary = (
-            f"远端状态={sync_result.get('status') or 'not_found'}, "
-            f"探测={sync_result.get('remote_state') or 'not_checked'}"
-        )
-        items.append(
-            {
-                "id": acc_model.id,
-                "email": acc_model.email,
-                "ok": ok,
-                "message": f"CLIProxyAPI 状态同步完成：{summary}",
-                "status": acc_model.status,
-            }
-        )
+        items.append(item)
+        if progress_callback:
+            progress_callback(
+                {
+                    "completed": completed,
+                    "total": total,
+                    "success": success_count,
+                    "failed": failed_count,
+                    "item": item,
+                    "sync_result": sync_result,
+                }
+            )
+
+    sync_chatgpt_cliproxyapi_status_batch(sync_accounts, on_progress=_on_progress)
     return {
         "total": len(items),
         "success": success_count,
         "failed": failed_count,
         "items": items,
     }
+
+
+def _run_cliproxy_batch_sync_task(task_id: str, platform: str, body_data: dict[str, Any]):
+    with Session(engine) as session:
+        try:
+            body = BatchActionRequest(**body_data)
+            update_task(
+                task_id,
+                status="running",
+                completed=0,
+                total=0,
+                success=0,
+                failed=0,
+                progress="0/0",
+                meta_patch={
+                    "action_id": "sync_cliproxyapi_status",
+                    "label": "CLIProxyAPI 状态同步",
+                },
+            )
+            accounts, missing_ids = _resolve_batch_accounts(platform, body, session)
+            total = len(accounts) + len(missing_ids)
+            update_task(task_id, total=total, progress=f"0/{total}" if total else "0/0")
+
+            if total == 0:
+                append_task_log(task_id, "没有可同步的账号")
+                update_task(
+                    task_id,
+                    status="done",
+                    result={"total": 0, "success": 0, "failed": 0, "items": []},
+                )
+                return
+
+            append_task_log(task_id, f"开始同步 {total} 个账号的 CLIProxyAPI 状态")
+
+            items: list[dict[str, Any]] = []
+            success_count = 0
+            failed_count = 0
+            completed = 0
+
+            for missing_id in missing_ids:
+                completed += 1
+                failed_count += 1
+                item = {
+                    "id": missing_id,
+                    "email": "",
+                    "ok": False,
+                    "message": "账号不存在",
+                    "status": "",
+                }
+                items.append(item)
+                append_task_log(task_id, f"[{completed}/{total}] 账号 #{missing_id}: 账号不存在")
+                update_task(
+                    task_id,
+                    completed=completed,
+                    success=success_count,
+                    failed=failed_count,
+                    progress=f"{completed}/{total}",
+                )
+
+            def _handle_progress(snapshot: dict[str, Any]):
+                overall_completed = completed + int(snapshot["completed"])
+                overall_success = success_count + int(snapshot["success"])
+                overall_failed = failed_count + int(snapshot["failed"])
+                item = snapshot["item"]
+                sync_result = snapshot["sync_result"]
+                items.append(item)
+
+                should_log_each_item = total <= 20 or not item["ok"]
+                if should_log_each_item:
+                    append_task_log(
+                        task_id,
+                        f"[{overall_completed}/{total}] {item['email'] or '-'}: {_cliproxy_sync_state_label(sync_result)}",
+                    )
+                elif overall_completed == total or overall_completed % 25 == 0:
+                    append_task_log(
+                        task_id,
+                        f"已完成 {overall_completed}/{total}，成功 {overall_success}，失败 {overall_failed}",
+                    )
+
+                update_task(
+                    task_id,
+                    completed=overall_completed,
+                    success=overall_success,
+                    failed=overall_failed,
+                    progress=f"{overall_completed}/{total}",
+                )
+
+            actual_result = _execute_batch_cliproxy_sync(
+                accounts,
+                session,
+                progress_callback=_handle_progress,
+            )
+            session.commit()
+
+            batch_result = {
+                "total": total,
+                "success": success_count + actual_result["success"],
+                "failed": failed_count + actual_result["failed"],
+                "items": items,
+            }
+            append_task_log(
+                task_id,
+                f"同步完成：成功 {batch_result['success']}，失败 {batch_result['failed']}",
+            )
+            update_task(
+                task_id,
+                status="done",
+                completed=total,
+                success=batch_result["success"],
+                failed=batch_result["failed"],
+                progress=f"{total}/{total}",
+                result=batch_result,
+            )
+        except Exception as exc:
+            session.rollback()
+            append_task_log(task_id, f"同步失败: {exc}")
+            update_task(task_id, status="failed", error=str(exc))
 
 
 @router.get("/{platform}")
@@ -317,6 +475,31 @@ def execute_batch_action(
         "failed": failed_count,
         "items": items,
     }
+
+
+@router.post("/{platform}/{action_id}/batch-task")
+def execute_batch_action_task(
+    platform: str,
+    action_id: str,
+    body: BatchActionRequest,
+    background_tasks: BackgroundTasks,
+):
+    if platform != "chatgpt" or action_id != "sync_cliproxyapi_status":
+        raise HTTPException(400, "当前批量任务仅支持 ChatGPT 的 CLIProxyAPI 状态同步")
+
+    task_id = enqueue_background_task(
+        platform=platform,
+        source="batch_action",
+        runner=_run_cliproxy_batch_sync_task,
+        runner_args=(platform, body.model_dump()),
+        background_tasks=background_tasks,
+        meta={
+            "action_id": action_id,
+            "label": "CLIProxyAPI 状态同步",
+        },
+        progress="0/0",
+    )
+    return {"task_id": task_id}
 
 
 @router.post("/{platform}/{account_id}/{action_id}")
