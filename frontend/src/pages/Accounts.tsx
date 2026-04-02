@@ -33,6 +33,7 @@ import { apiFetch, API_BASE } from '@/lib/utils'
 import { normalizeExecutorForPlatform } from '@/lib/registerOptions'
 
 const { Text } = Typography
+const ACCOUNT_PAGE_SIZE = 20
 
 const STATUS_COLORS: Record<string, string> = {
   registered: 'default',
@@ -560,6 +561,7 @@ export default function Accounts() {
   const [accounts, setAccounts] = useState<any[]>([])
   const [platformActions, setPlatformActions] = useState<any[]>([])
   const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(false)
   const [search, setSearch] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
@@ -582,7 +584,11 @@ export default function Accounts() {
   const [statusSyncLoading, setStatusSyncLoading] = useState<'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | ''>('')
 
   useEffect(() => {
-    if (platform) setCurrentPlatform(platform)
+    if (platform) {
+      setCurrentPlatform(platform)
+      setPage(1)
+      setSelectedRowKeys([])
+    }
   }, [platform])
 
   useEffect(() => {
@@ -596,16 +602,20 @@ export default function Accounts() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const params = new URLSearchParams({ platform: currentPlatform, page: '1', page_size: '100' })
+      const params = new URLSearchParams({
+        platform: currentPlatform,
+        page: String(page),
+        page_size: String(ACCOUNT_PAGE_SIZE),
+      })
       if (search) params.set('email', search)
       if (filterStatus) params.set('status', filterStatus)
       const data = await apiFetch(`/accounts?${params}`)
       setAccounts((data.items || []).map(normalizeAccount))
-      setTotal(data.total)
+      setTotal(data.total || 0)
     } finally {
       setLoading(false)
     }
-  }, [currentPlatform, search, filterStatus])
+  }, [currentPlatform, filterStatus, page, search])
 
   useEffect(() => {
     load()
@@ -631,16 +641,28 @@ export default function Accounts() {
     }
   }
 
-  const exportCsv = () => {
-    const header = 'email,password,status,region,cashier_url,created_at'
-    const rows = accounts.map((a) => [a.email, a.password, a.status, a.region, a.cashier_url, a.created_at].join(','))
-    const blob = new Blob([[header, ...rows].join('\n')], { type: 'text/csv' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `${currentPlatform}_accounts.csv`
-    a.click()
-    URL.revokeObjectURL(url)
+  const exportCsv = async () => {
+    try {
+      const params = new URLSearchParams({ platform: currentPlatform })
+      if (search) params.set('email', search)
+      if (filterStatus) params.set('status', filterStatus)
+
+      const res = await fetch(`${API_BASE}/accounts/export?${params}`)
+      if (!res.ok) {
+        throw new Error(await res.text())
+      }
+
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${currentPlatform}_accounts.csv`
+      a.click()
+      URL.revokeObjectURL(url)
+      message.success('导出成功')
+    } catch (e: any) {
+      message.error(`导出失败: ${e.message}`)
+    }
   }
 
   const handleDelete = async (id: number) => {
@@ -945,6 +967,18 @@ export default function Accounts() {
 
   const getBackfillScope = (): 'selected' | 'pending' => (selectedRowKeys.length > 0 ? 'selected' : 'pending')
 
+  const handleSearch = (value: string) => {
+    setSelectedRowKeys([])
+    setPage(1)
+    setSearch(value)
+  }
+
+  const handleStatusChange = (value?: string) => {
+    setSelectedRowKeys([])
+    setPage(1)
+    setFilterStatus(value || '')
+  }
+
   const backfillButtonLabel = () => {
     const scope = getBackfillScope()
     const count = scope === 'selected' ? selectedRowKeys.length : total
@@ -1176,14 +1210,14 @@ export default function Accounts() {
           <Input.Search
             placeholder="搜索邮箱..."
             allowClear
-            onSearch={setSearch}
+            onSearch={handleSearch}
             style={{ width: 200 }}
           />
           <Select
             placeholder="状态筛选"
             allowClear
             style={{ width: 120 }}
-            onChange={setFilterStatus}
+            onChange={handleStatusChange}
             options={[
               { value: 'registered', label: '已注册' },
               { value: 'trial', label: '试用中' },
@@ -1242,7 +1276,7 @@ export default function Accounts() {
             </Popconfirm>
           )}
           <Button icon={<UploadOutlined />} onClick={() => setImportModalOpen(true)}>导入</Button>
-          <Button icon={<DownloadOutlined />} onClick={exportCsv} disabled={accounts.length === 0}>导出</Button>
+          <Button icon={<DownloadOutlined />} onClick={exportCsv} disabled={total === 0}>导出</Button>
           <Button icon={<PlusOutlined />} onClick={() => setAddModalOpen(true)}>新增</Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={() => setRegisterModalOpen(true)}>注册</Button>
           <Button icon={<ReloadOutlined spin={loading} />} onClick={load} />
@@ -1256,10 +1290,17 @@ export default function Accounts() {
         loading={loading}
         size="middle"
         rowSelection={{
+          preserveSelectedRowKeys: true,
           selectedRowKeys,
           onChange: setSelectedRowKeys,
         }}
-        pagination={{ pageSize: 20, showSizeChanger: false }}
+        pagination={{
+          current: page,
+          pageSize: ACCOUNT_PAGE_SIZE,
+          total,
+          showSizeChanger: false,
+          onChange: (nextPage) => setPage(nextPage),
+        }}
         scroll={{ x: isChatgptPlatform ? 1440 : 980 }}
         onRow={(record) => ({
           onDoubleClick: () => {

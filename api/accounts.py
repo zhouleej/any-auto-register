@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select, func
 from pydantic import BaseModel
@@ -41,19 +41,26 @@ def list_accounts(
     platform: Optional[str] = None,
     status: Optional[str] = None,
     email: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=200),
     session: Session = Depends(get_session),
 ):
-    q = select(AccountModel)
+    filters = []
     if platform:
-        q = q.where(AccountModel.platform == platform)
+        filters.append(AccountModel.platform == platform)
     if status:
-        q = q.where(AccountModel.status == status)
+        filters.append(AccountModel.status == status)
     if email:
-        q = q.where(AccountModel.email.contains(email))
-    total = len(session.exec(q).all())
-    items = session.exec(q.offset((page - 1) * page_size).limit(page_size)).all()
+        filters.append(AccountModel.email.contains(email))
+
+    total_q = select(func.count()).select_from(AccountModel)
+    items_q = select(AccountModel).order_by(AccountModel.created_at.desc(), AccountModel.id.desc())
+    if filters:
+        total_q = total_q.where(*filters)
+        items_q = items_q.where(*filters)
+
+    total = session.exec(total_q).one()
+    items = session.exec(items_q.offset((page - 1) * page_size).limit(page_size)).all()
     return {"total": total, "page": page, "items": items}
 
 
@@ -89,6 +96,7 @@ def get_stats(session: Session = Depends(get_session)):
 def export_accounts(
     platform: Optional[str] = None,
     status: Optional[str] = None,
+    email: Optional[str] = None,
     session: Session = Depends(get_session),
 ):
     q = select(AccountModel)
@@ -96,7 +104,9 @@ def export_accounts(
         q = q.where(AccountModel.platform == platform)
     if status:
         q = q.where(AccountModel.status == status)
-    accounts = session.exec(q).all()
+    if email:
+        q = q.where(AccountModel.email.contains(email))
+    accounts = session.exec(q.order_by(AccountModel.created_at.desc(), AccountModel.id.desc())).all()
 
     output = io.StringIO()
     writer = csv.writer(output)
